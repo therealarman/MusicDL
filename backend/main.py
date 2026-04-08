@@ -110,6 +110,8 @@ async def startup() -> None:
     Path(settings.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
+    print("This is a test message")
+
     # Warn about missing system deps
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)

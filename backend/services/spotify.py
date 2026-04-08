@@ -94,9 +94,9 @@ class SpotifyService:
 
         results = self.client.album_tracks(album_id, limit=50)
         items = list(results["items"])
-        while results["next"] and len(items) < settings.MAX_PLAYLIST_SIZE:
+        while results.get("next") and len(items) < settings.MAX_PLAYLIST_SIZE:
             results = self.client.next(results)
-            items.extend(results["items"])
+            items.extend(results.get("items", []))
 
         for i, item in enumerate(items[: settings.MAX_PLAYLIST_SIZE]):
             try:
@@ -110,15 +110,21 @@ class SpotifyService:
         return tracks, album_name
 
     def get_playlist(self, playlist_id: str) -> Tuple[List[TrackInfo], str]:
-        playlist = self.client.playlist(playlist_id)
+        playlist = self.client.playlist(playlist_id, fields="id,name")
         playlist_name = playlist["name"]
         tracks: List[TrackInfo] = []
 
-        results = playlist["tracks"]
+        # Use playlist_items() directly to avoid relying on playlist["tracks"],
+        # which can be absent or None in some Spotify API responses.
+        results = self.client.playlist_items(
+            playlist_id,
+            limit=100,
+            additional_types=["track"],
+        )
         items = list(results["items"])
-        while results["next"] and len(items) < settings.MAX_PLAYLIST_SIZE:
+        while results.get("next") and len(items) < settings.MAX_PLAYLIST_SIZE:
             results = self.client.next(results)
-            items.extend(results["items"])
+            items.extend(results.get("items", []))
 
         for i, item in enumerate(items[: settings.MAX_PLAYLIST_SIZE]):
             try:

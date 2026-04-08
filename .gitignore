@@ -5,6 +5,7 @@
 
 # Claude
 .claude/
+.cache
 
 # Python
 __pycache__/

@@ -20,65 +20,74 @@ Supports individual tracks, full playlists, and albums with metadata embedding a
 
 ---
 
-## Prerequisites
+## Requirements
 
-| Tool | Install |
-|------|---------|
-| Python 3.10+ | https://python.org |
-| ffmpeg | https://ffmpeg.org/download.html |
-| yt-dlp | Installed via pip (see below) |
+| Tool | Version | Notes |
+|------|---------|-------|
+| Python | 3.10+ | [python.org](https://python.org) |
+| ffmpeg | Any recent | Required for audio conversion |
+| Git | Any | To clone the repo |
 
 ### Install ffmpeg (Windows)
 
-1. Download from https://ffmpeg.org/download.html → Windows builds
-2. Extract and add the `bin/` folder to your `PATH`
-3. Verify: `ffmpeg -version`
+1. Download a Windows build from [ffmpeg.org/download.html](https://ffmpeg.org/download.html)
+2. Extract the archive and add the `bin/` folder to your system `PATH`
+3. Verify it works: `ffmpeg -version`
 
 ---
 
-## Setup
+## Installation
 
-### 1. Clone / copy the project
+### 1. Clone the repository
 
-```
+```bash
+git clone https://github.com/your-username/MusicDownloader.git
 cd MusicDownloader
 ```
 
 ### 2. Install Python dependencies
 
 ```bash
-cd backend
-pip install -r requirements.txt
-cd ..
+pip install -r backend/requirements.txt
 ```
 
-### 3. Configure environment
+### 3. Configure environment variables
 
 ```bash
-cp .env.example .env
-# Edit .env and fill in your Spotify API credentials (optional — only needed for Spotify)
+copy .env.example .env
 ```
+
+Open `.env` and fill in your settings. Spotify credentials are only required if you want to download from Spotify — YouTube works without them.
 
 #### Getting Spotify API credentials
 
-1. Go to https://developer.spotify.com/dashboard
-2. Log in and click **Create App**
-3. Set the redirect URI to `http://localhost:8000` (or anything)
-4. Copy the **Client ID** and **Client Secret** into `.env`
+1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) and log in
+2. Click **Create App**, give it any name and description
+3. Set the Redirect URI to `http://localhost:8000`
+4. Open the app settings and copy the **Client ID** and **Client Secret**
+5. Paste them into `.env`:
+   ```
+   SPOTIFY_CLIENT_ID=your_client_id_here
+   SPOTIFY_CLIENT_SECRET=your_client_secret_here
+   ```
 
-### 4. Run the server
+---
+
+## Running the App
+
+Double-click **`start.bat`** in the project root.
+
+- A terminal opens showing the server output
+- Your browser opens automatically at `http://127.0.0.1:8000`
+- Press **Ctrl+C** in the terminal to stop the server
+
+To start manually instead:
 
 ```bash
-python -m backend.main
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-Or using uvicorn directly:
-
-```bash
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Open your browser at **http://localhost:8000**
+Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
 
 ---
 
@@ -89,7 +98,7 @@ Open your browser at **http://localhost:8000**
 3. Select the tracks you want
 4. Customize the filename template and audio settings
 5. Click **Download Selected** or **Download All**
-6. Watch real-time progress and download when complete
+6. Watch real-time progress, then download when complete
 
 ---
 
@@ -132,6 +141,7 @@ MusicDownloader/
 │   └── src/
 │       ├── app.js           Single-page app (vanilla JS)
 │       └── styles/main.css  Dark theme CSS
+├── start.bat                Double-click to run
 ├── .env                     Your config (not committed)
 ├── .env.example             Config template
 └── README.md
@@ -156,10 +166,12 @@ MusicDownloader/
 
 ## Troubleshooting
 
-**ffmpeg not found**: Make sure `ffmpeg` is in your PATH. Run `ffmpeg -version` to verify.
+**ffmpeg not found** — Make sure `ffmpeg` is in your PATH. Run `ffmpeg -version` to verify.
 
-**Spotify errors**: Check your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`.
+**Spotify errors** — Check your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`.
 
-**YouTube download fails**: Update yt-dlp: `pip install -U yt-dlp`
+**YouTube download fails** — Update yt-dlp: `pip install -U yt-dlp`
 
-**No audio conversion**: ffmpeg must be installed for format conversion beyond the source format.
+**No audio conversion** — ffmpeg must be installed for format conversion beyond the source format.
+
+**Port already in use** — Another process is on port 8000. Either stop it or change `PORT` in `.env`.
