@@ -89,7 +89,8 @@ class SpotifyService:
 
         # Use `or` instead of `.get(key, default)` so that an explicit null
         # from the API (key present, value None) still falls back to the default.
-        artists = [a["name"] for a in (track.get("artists") or [])]
+        artist_objects = track.get("artists") or []
+        artists = [a["name"] for a in artist_objects]
         album = track.get("album") or {}
         release_date = album.get("release_date") or ""
         year = release_date[:4] if release_date else ""

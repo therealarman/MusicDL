@@ -47,7 +47,7 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 24px;
+  padding: 18px 24px; /* ← header height: increase padding to make it taller */
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   position: sticky;
@@ -59,13 +59,14 @@ header {
 .logo {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 18px;
+  gap: 12px;
+  font-size: 22px; /* ← logo text size */
   font-weight: 700;
   color: var(--text);
 }
 
 .logo svg { color: var(--accent); }
+.logo-icon { width: 45px; height: 45px; object-fit: contain; } /* ← icon size */
 
 
 main { flex: 1; padding: 28px 24px; max-width: 1100px; margin: 0 auto; width: 100%; }

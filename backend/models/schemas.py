@@ -57,7 +57,6 @@ class TrackInfo(BaseModel):
     disc_number: int = 1
     year: str = ""
     date: str = ""
-    genre: str = ""
     duration_ms: int = 0
     isrc: str = ""
     source: SourceType = SourceType.YOUTUBE

@@ -63,7 +63,7 @@ Open `.env` and fill in your settings. Spotify credentials are only required if 
 
 1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) and log in
 2. Click **Create App**, give it any name and description
-3. Set the Redirect URI to `http://localhost:8000`
+3. Set the Redirect URI to `http://localhost:8000/api/spotify/callback`
 4. Open the app settings and copy the **Client ID** and **Client Secret**
 5. Paste them into `.env`:
    ```
@@ -78,8 +78,11 @@ Open `.env` and fill in your settings. Spotify credentials are only required if 
 Double-click **`start.bat`** in the project root.
 
 - A terminal opens showing the server output
-- Your browser opens automatically at `http://127.0.0.1:8000`
+- Your browser opens automatically at the Spotify login page — authorize the app once, and you'll be redirected to the downloader
+- ~~If you're only using YouTube, navigate to `http://127.0.0.1:8000` directly to skip auth~~
 - Press **Ctrl+C** in the terminal to stop the server
+
+> **Note:** The Spotify token is stored in memory. If you restart the server, you'll need to authorize again via the login page (or just re-run `start.bat`).
 
 To start manually instead:
 
@@ -106,13 +109,18 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
 
 | Token | Example |
 |-------|---------|
-| `{title}` | Bohemian Rhapsody |
-| `{artist}` | Queen |
-| `{album}` | A Night at the Opera |
-| `{track_number}` | 01 |
-| `{year}` | 1975 |
-| `{genre}` | Rock |
-| `{playlist_index}` | 003 |
+| `{title}` | Left And Right |
+| `{artist}` | D'Angelo |
+| `{artists}` | D'Angelo, Redman, Method Man |
+| `{album}` | Voodoo |
+| `{album_artist}` | D'Angelo |
+| `{track_number}` | 03 |
+| `{disc_number}` | 1 |
+| `{year}` | 2000 |
+| `{date}` | 2000-01-31 |
+| `{duration}` | 06:46 |
+| `{playlist}` | Soulquarian Mix |
+| `{playlist_index}` | 015 |
 | `{source}` | spotify |
 
 ---
@@ -159,6 +167,8 @@ MusicDownloader/
 | GET | `/api/download/{job}/{track}` | Download a single file |
 | GET | `/api/batch/{id}` | Download all files as ZIP |
 | POST | `/api/cancel/{id}` | Cancel an active job |
+| GET | `/api/spotify/login` | Redirect to Spotify authorization page |
+| GET | `/api/spotify/callback` | Spotify OAuth callback (set as Redirect URI in dashboard) |
 | GET | `/api/health` | Health check |
 | GET | `/api/tokens` | Available filename template tokens |
 
@@ -168,7 +178,9 @@ MusicDownloader/
 
 **ffmpeg not found** — Make sure `ffmpeg` is in your PATH. Run `ffmpeg -version` to verify.
 
-**Spotify errors** — Check your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`.
+**Spotify not authenticated** — The app requires a one-time OAuth login per server session. Run `start.bat` (or navigate to `http://127.0.0.1:8000/api/spotify/login`) to authorize.
+
+**Spotify credentials missing** — Check your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`. Make sure the Redirect URI in your Spotify dashboard matches `http://localhost:8000/api/spotify/callback`.
 
 **YouTube download fails** — Update yt-dlp: `pip install -U yt-dlp`
 

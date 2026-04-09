@@ -33,7 +33,7 @@ def embed_metadata(file_path: str, track, album_art_data: Optional[bytes] = None
 
 def _embed_mp3(file_path: str, track, album_art_data: Optional[bytes]) -> None:
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, APIC, TIT2, TPE1, TPE2, TALB, TRCK, TPOS, TDRC, TCON
+    from mutagen.id3 import ID3, APIC, TIT2, TPE1, TPE2, TALB, TRCK, TPOS, TDRC
 
     audio = MP3(file_path)
     audio.tags = ID3()
@@ -52,9 +52,6 @@ def _embed_mp3(file_path: str, track, album_art_data: Optional[bytes]) -> None:
         tags.add(TPOS(encoding=3, text=str(track.disc_number)))
     if track.date or track.year:
         tags.add(TDRC(encoding=3, text=track.date or track.year))
-    if track.genre:
-        tags.add(TCON(encoding=3, text=track.genre))
-
     if album_art_data:
         art = _to_jpeg(album_art_data)
         # Windows Explorer requires encoding=0 (Latin-1) and an empty description on
@@ -91,9 +88,6 @@ def _embed_flac(file_path: str, track, album_art_data: Optional[bytes]) -> None:
         audio["discnumber"] = str(track.disc_number)
     if track.date or track.year:
         audio["date"] = track.date or track.year
-    if track.genre:
-        audio["genre"] = track.genre
-
     if album_art_data:
         art = _to_jpeg(album_art_data)
         pic = Picture()
@@ -124,8 +118,6 @@ def _embed_m4a(file_path: str, track, album_art_data: Optional[bytes]) -> None:
         audio["disk"] = [(track.disc_number, 0)]
     if track.date or track.year:
         audio["\xa9day"] = [track.date or track.year]
-    if track.genre:
-        audio["\xa9gen"] = [track.genre]
     if album_art_data:
         art = _to_jpeg(album_art_data)
         audio["covr"] = [MP4Cover(art, imageformat=MP4Cover.FORMAT_JPEG)]
@@ -150,8 +142,6 @@ def _embed_ogg(file_path: str, track, album_art_data: Optional[bytes]) -> None:
         audio["discnumber"] = [str(track.disc_number)]
     if track.date or track.year:
         audio["date"] = [track.date or track.year]
-    if track.genre:
-        audio["genre"] = [track.genre]
     audio.save()
 
 
@@ -159,7 +149,7 @@ def _embed_wav(file_path: str, track, album_art_data: Optional[bytes]) -> None:
     # WAV uses an ID3 chunk internally; Windows Explorer cannot display WAV album art
     # thumbnails regardless, so we write text tags only.
     from mutagen.wave import WAVE
-    from mutagen.id3 import TIT2, TPE1, TPE2, TALB, TRCK, TDRC, TCON
+    from mutagen.id3 import TIT2, TPE1, TPE2, TALB, TRCK, TDRC
 
     audio = WAVE(file_path)
     if audio.tags is None:
@@ -178,7 +168,4 @@ def _embed_wav(file_path: str, track, album_art_data: Optional[bytes]) -> None:
         tags.add(TRCK(encoding=3, text=str(track.track_number)))
     if track.date or track.year:
         tags.add(TDRC(encoding=3, text=track.date or track.year))
-    if track.genre:
-        tags.add(TCON(encoding=3, text=track.genre))
-
     audio.save()

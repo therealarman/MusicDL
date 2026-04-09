@@ -137,7 +137,6 @@ function previewTemplate(template, sampleTrack) {
     disc_number: String(sampleTrack.disc_number || 1),
     year: sampleTrack.year || '2024',
     date: sampleTrack.date || '2024-01-01',
-    genre: sampleTrack.genre || 'Unknown',
     duration: dur,
     playlist: sampleTrack.playlist_name || 'Playlist',
     playlist_index: String(sampleTrack.playlist_index || 1).padStart(3, '0'),
@@ -206,7 +205,7 @@ function renderHeader() {
   const header = document.querySelector('header');
   header.innerHTML = `
     <div class="logo">
-      ${svg(ICONS.music, 22)}
+      <img src="icons/icon.png" class="logo-icon" alt="">
       <span>MusicDL</span>
     </div>
   `;
