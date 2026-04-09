@@ -151,24 +151,31 @@ async def run_download_job(job_id: str) -> None:
 
 # ── Per-track downloader ───────────────────────────────────────────────────────
 
+def _is_age_restricted(exc: Exception) -> bool:
+    return "sign in to confirm your age" in str(exc).lower()
+
+
 async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) -> None:
     track_id = track.id
     fmt = job.settings.format.value
     quality = job.settings.quality.value
 
     try:
-        # 1. Resolve YouTube URL for Spotify tracks
+        # 1. Resolve YouTube URL(s) for Spotify tracks
         yt_url = track.youtube_url or (track.url if track.source.value == "youtube" else None)
+        fallbacks: List[str] = []
 
         if not yt_url:
             await _track_update(job, track_id, "searching", 0, "Searching YouTube…")
             query = f"{track.artist} - {track.title}"
             loop = asyncio.get_event_loop()
-            yt_url = await loop.run_in_executor(
+            candidates = await loop.run_in_executor(
                 None, youtube_service.search_video, query, track.duration_ms
             )
-            if not yt_url:
+            if not candidates:
                 raise RuntimeError(f"No YouTube match found for: {track.artist} - {track.title}")
+            yt_url = candidates[0]
+            fallbacks = candidates[1:]
 
         await _track_update(job, track_id, "downloading", 0, "Starting download…")
 
@@ -176,7 +183,7 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
         filename = apply_template(job.settings.filename_template, track)
         out_template = str(job_temp / f"{filename}.%(ext)s")
 
-        # 3. Download (with live progress polling)
+        # 3. Download (with live progress polling, retrying on age restriction)
         dl_state = {"pct": 0.0, "stage": "downloading"}
 
         def on_progress(pct: float, stage: str) -> None:
@@ -197,21 +204,35 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
                 )
                 await asyncio.sleep(0.5)
 
-        progress_done = asyncio.Event()
-        poll_task = asyncio.create_task(poll_progress(progress_done))
+        urls_to_try = [yt_url] + fallbacks
+        file_path = None
 
-        try:
-            file_path = await youtube_service.download_audio(
-                url=yt_url,
-                output_template=out_template,
-                fmt=fmt,
-                quality=quality,
-                normalize=job.settings.normalize_audio,
-                on_progress=on_progress,
-            )
-        finally:
-            progress_done.set()
-            await poll_task
+        for i, attempt_url in enumerate(urls_to_try):
+            if i > 0:
+                dl_state["pct"] = 0.0
+                dl_state["stage"] = "downloading"
+                await _track_update(job, track_id, "downloading", 0, "Trying alternative source…")
+
+            progress_done = asyncio.Event()
+            poll_task = asyncio.create_task(poll_progress(progress_done))
+
+            try:
+                file_path = await youtube_service.download_audio(
+                    url=attempt_url,
+                    output_template=out_template,
+                    fmt=fmt,
+                    quality=quality,
+                    normalize=job.settings.normalize_audio,
+                    on_progress=on_progress,
+                )
+                break  # success — stop trying
+            except Exception as exc:
+                if i < len(urls_to_try) - 1 and _is_age_restricted(exc):
+                    continue
+                raise
+            finally:
+                progress_done.set()
+                await poll_task
 
         if job.cancel_event.is_set():
             await _track_update(job, track_id, "cancelled", 0)

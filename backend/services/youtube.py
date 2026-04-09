@@ -84,32 +84,27 @@ class YouTubeService:
             )
         return tracks, playlist_name
 
-    def search_video(self, query: str, duration_ms: Optional[int] = None) -> Optional[str]:
-        """Search YouTube for the best matching video."""
+    def search_video(self, query: str, duration_ms: Optional[int] = None) -> List[str]:
+        """Search YouTube and return candidate URLs, best match first."""
         import yt_dlp
         opts = {**self._quiet_opts(), "extract_flat": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             results = ydl.extract_info(f"ytsearch5:{query}", download=False)
 
-        entries = [e for e in (results.get("entries") or []) if e]
-        if not entries:
-            return None
+        entries = [e for e in (results.get("entries") or []) if e and e.get("id")]
 
         if duration_ms:
             target_s = duration_ms / 1000
-            best = None
-            best_diff = float("inf")
-            for entry in entries:
-                dur = entry.get("duration")
-                if dur:
-                    diff = abs(dur - target_s)
-                    if diff < best_diff and diff < 30:
-                        best_diff = diff
-                        best = entry
-            if best:
-                return f"https://www.youtube.com/watch?v={best['id']}"
 
-        return f"https://www.youtube.com/watch?v={entries[0]['id']}"
+            def sort_key(e):
+                dur = e.get("duration")
+                if dur and abs(dur - target_s) < 30:
+                    return abs(dur - target_s)
+                return float("inf")
+
+            entries.sort(key=sort_key)
+
+        return [f"https://www.youtube.com/watch?v={e['id']}" for e in entries]
 
     async def download_audio(
         self,

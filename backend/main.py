@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .routers import download, fetch, status
+from .routers import download, fetch, spotify_auth, status
 from .services.filename import AVAILABLE_TOKENS, TEMPLATE_PRESETS
 
 app = FastAPI(
@@ -30,6 +30,7 @@ app.add_middleware(
 app.include_router(fetch.router, prefix="/api")
 app.include_router(download.router, prefix="/api")
 app.include_router(status.router, prefix="/api")
+app.include_router(spotify_auth.router, prefix="/api")
 
 
 @app.get("/api/health")
