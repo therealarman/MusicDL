@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 <p align="center">
   <a href="https://github.com/therealarman/MusicDL/">
     <img width="250" height="250" alt="D'Angelo Icon" src="frontend/icons/icon.png" />
