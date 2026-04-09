@@ -1,4 +1,25 @@
-# MusicDL — Music Downloader
+<p align="center">
+  <a href="https://github.com/therealarman/MusicDL/">
+    <img width="250" height="250" alt="D'Angelo Icon" src="frontend/icons/icon.png" />
+  </a>
+</p>
+
+<br/>
+<br/>
+
+<div align="center">
+    <strong>Locally hosted software for downloading music off of Spotify and YouTube.</strong>
+    <br />
+    <br />
+
+</div>
+
+<div align="center">
+
+</div>
+</div>
+
+# MusicDL
 
 A full-stack web application to download music from **Spotify** and **YouTube**.
 Supports individual tracks, full playlists, and albums with metadata embedding and custom filename templates.
