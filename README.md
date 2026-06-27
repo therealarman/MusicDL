@@ -8,7 +8,7 @@
 <br/>
 
 <div align="center">
-    <strong>Locally hosted software for downloading music off of Spotify and YouTube.</strong>
+    <strong>Standalone desktop app for downloading music from Spotify and YouTube.</strong>
     <br />
     <br />
 
@@ -21,7 +21,7 @@
 
 # MusicDL
 
-A full-stack web application to download music from **Spotify** and **YouTube**.
+A standalone **desktop application** to download music from **Spotify** and **YouTube**.
 Supports individual tracks, full playlists, and albums with metadata embedding and custom filename templates.
 
 ---
@@ -33,11 +33,10 @@ Supports individual tracks, full playlists, and albums with metadata embedding a
 - Bitrate selection: 128 / 192 / 256 / 320 kbps or Best
 - Customizable filename templates with live preview (`{artist} - {title}`, etc.)
 - Full metadata embedding (ID3 tags, album art)
-- Real-time progress via Server-Sent Events
+- Real-time download progress
 - Batch download with ZIP archive
 - Download history panel
-- Drag & drop URL input
-- Dark themed, responsive UI
+- Dark themed native desktop UI
 
 ---
 
@@ -96,22 +95,16 @@ Open `.env` and fill in your settings. Spotify credentials are only required if 
 
 ## Running the App
 
-Double-click **`start.bat`** in the project root.
-
-- A terminal opens showing the server output
-- Your browser opens automatically at the Spotify login page — authorize the app once, and you'll be redirected to the downloader
-- ~~If you're only using YouTube, navigate to `http://127.0.0.1:8000` directly to skip auth~~
-- Press **Ctrl+C** in the terminal to stop the server
-
-> **Note:** The Spotify token is stored in memory. If you restart the server, you'll need to authorize again via the login page (or just re-run `start.bat`).
-
-To start manually instead:
-
 ```bash
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+python main.py
 ```
 
-Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
+The desktop window opens automatically. No browser required.
+
+- The backend starts in the background automatically
+- For Spotify: click **Connect Spotify** in the app to authorize once per session
+- For YouTube: just paste a URL and download — no auth needed
+- Close the window to stop the app
 
 ---
 
@@ -122,7 +115,7 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
 3. Select the tracks you want
 4. Customize the filename template and audio settings
 5. Click **Download Selected** or **Download All**
-6. Watch real-time progress, then download when complete
+6. Watch real-time progress — use **Open Folder** when complete
 
 ---
 
@@ -150,14 +143,21 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
 
 ```
 MusicDownloader/
+├── main.py                  Entry point — starts backend + desktop window
+├── gui/
+│   ├── __init__.py
+│   ├── style.py             QSS stylesheet (dark theme)
+│   ├── workers.py           Background workers (fetch, SSE, image loading)
+│   └── window.py            Main window and all UI widgets
 ├── backend/
-│   ├── main.py              FastAPI entry point
+│   ├── main.py              FastAPI app (runs in daemon thread)
 │   ├── config.py            Settings from .env
 │   ├── models/schemas.py    Pydantic models
 │   ├── routers/
 │   │   ├── fetch.py         URL metadata fetching
 │   │   ├── download.py      Download + file serving
-│   │   └── status.py        SSE progress stream
+│   │   ├── status.py        SSE progress stream
+│   │   └── spotify_auth.py  Spotify OAuth flow
 │   ├── services/
 │   │   ├── spotify.py       Spotify API wrapper
 │   │   ├── youtube.py       yt-dlp wrapper
@@ -165,12 +165,6 @@ MusicDownloader/
 │   │   ├── filename.py      Template system
 │   │   └── queue.py         Download queue manager
 │   └── requirements.txt
-├── frontend/
-│   ├── index.html
-│   └── src/
-│       ├── app.js           Single-page app (vanilla JS)
-│       └── styles/main.css  Dark theme CSS
-├── start.bat                Double-click to run
 ├── .env                     Your config (not committed)
 ├── .env.example             Config template
 └── README.md
@@ -178,33 +172,18 @@ MusicDownloader/
 
 ---
 
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/fetch` | Fetch track metadata from a URL |
-| POST | `/api/download` | Start a download job |
-| GET | `/api/status/{id}` | SSE stream of job progress |
-| GET | `/api/download/{job}/{track}` | Download a single file |
-| GET | `/api/batch/{id}` | Download all files as ZIP |
-| POST | `/api/cancel/{id}` | Cancel an active job |
-| GET | `/api/spotify/login` | Redirect to Spotify authorization page |
-| GET | `/api/spotify/callback` | Spotify OAuth callback (set as Redirect URI in dashboard) |
-| GET | `/api/health` | Health check |
-| GET | `/api/tokens` | Available filename template tokens |
-
----
-
 ## Troubleshooting
 
 **ffmpeg not found** — Make sure `ffmpeg` is in your PATH. Run `ffmpeg -version` to verify.
 
-**Spotify not authenticated** — The app requires a one-time OAuth login per server session. Run `start.bat` (or navigate to `http://127.0.0.1:8000/api/spotify/login`) to authorize.
+**Spotify not authenticated** — Click **Connect Spotify** in the app to complete the one-time OAuth login. The token is held in memory — you'll need to reconnect if you restart the app.
 
 **Spotify credentials missing** — Check your `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`. Make sure the Redirect URI in your Spotify dashboard matches `http://localhost:8000/api/spotify/callback`.
 
 **YouTube download fails** — Update yt-dlp: `pip install -U yt-dlp`
 
-**No audio conversion** — ffmpeg must be installed for format conversion beyond the source format.
+**Age-restricted videos** — In settings, select your browser under **Cookies Source** so yt-dlp can use your login cookies.
+
+**No audio conversion** — ffmpeg must be installed for format conversion.
 
 **Port already in use** — Another process is on port 8000. Either stop it or change `PORT` in `.env`.
