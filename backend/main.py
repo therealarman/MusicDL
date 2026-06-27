@@ -7,7 +7,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .routers import download, fetch, spotify_auth, status
@@ -111,28 +110,9 @@ async def startup() -> None:
     Path(settings.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
-    print("This is a test message")
-
-    # Warn about missing system deps
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
     except Exception:
         print("WARNING: ffmpeg not found. Install it from https://ffmpeg.org/", file=sys.stderr)
 
     asyncio.create_task(_cleanup_loop())
-
-
-# ── Frontend static files ──────────────────────────────────────────────────────
-_frontend_dir = Path(__file__).parent.parent / "frontend"
-if _frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "backend.main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=True,
-    )

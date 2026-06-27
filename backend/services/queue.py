@@ -100,6 +100,8 @@ async def _track_update(
     }
     if error:
         payload["error"] = error
+    if tp.file_path:
+        payload["file_path"] = tp.file_path
     await _emit(job, "track_update", payload)
 
 
@@ -118,7 +120,10 @@ async def run_download_job(job_id: str) -> None:
         "failed_tracks": 0,
     })
 
-    job_temp = Path(settings.TEMP_DIR) / job_id
+    if job.settings.output_dir:
+        job_temp = Path(job.settings.output_dir)
+    else:
+        job_temp = Path(settings.TEMP_DIR) / job_id
     job_temp.mkdir(parents=True, exist_ok=True)
 
     semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_DOWNLOADS)
@@ -170,7 +175,7 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
             query = f"{track.artist} - {track.title}"
             loop = asyncio.get_event_loop()
             candidates = await loop.run_in_executor(
-                None, youtube_service.search_video, query, track.duration_ms
+                None, youtube_service.search_video, query, track.duration_ms, job.settings.cookies_browser
             )
             if not candidates:
                 raise RuntimeError(f"No YouTube match found for: {track.artist} - {track.title}")
@@ -224,10 +229,11 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
                     quality=quality,
                     normalize=job.settings.normalize_audio,
                     on_progress=on_progress,
+                    cookies_browser=job.settings.cookies_browser,
                 )
                 break  # success — stop trying
             except Exception as exc:
-                if i < len(urls_to_try) - 1 and _is_age_restricted(exc):
+                if i < len(urls_to_try) - 1 and _is_age_restricted(exc) and not job.settings.cookies_browser:
                     continue
                 raise
             finally:

@@ -84,6 +84,8 @@ class DownloadSettings(BaseModel):
     normalize_audio: bool = False
     embed_artwork: bool = True
     download_thumbnail: bool = False
+    cookies_browser: str = ""   # e.g. "chrome", "firefox" — empty = disabled
+    output_dir: str = ""        # absolute path to save files; empty = use TEMP_DIR
 
 
 class DownloadRequest(BaseModel):

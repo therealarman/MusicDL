@@ -26,10 +26,38 @@ def _parse_yt_title(title: str, uploader: str = "") -> Tuple[str, str]:
     return uploader or "Unknown Artist", title
 
 
+_CLEAN_RE = re.compile(
+    r'\b(clean|radio\s+edit|radio\s+version|censored|explicit\s+free|'
+    r'edited|clean\s+version|clean\s+edit|sanitized)\b',
+    re.IGNORECASE,
+)
+
+
+def _check_cookie_error(exc: Exception) -> None:
+    """Re-raise cookie-related yt-dlp errors with clear, actionable messages."""
+    msg = str(exc).lower()
+    if "could not copy" in msg and "cookie" in msg:
+        raise RuntimeError(
+            "Browser cookie database is locked. "
+            "Close your browser completely (all windows) and try again. "
+            "Chrome, Edge, and Brave keep this file open while running."
+        ) from exc
+    if "dpapi" in msg or ("failed to decrypt" in msg and "cookie" in msg):
+        raise RuntimeError(
+            "Chrome v127+ uses App-Bound Encryption for cookies, which blocks external access on Windows. "
+            "Use Firefox instead — it works without this restriction."
+        ) from exc
+
+
 class YouTubeService:
 
-    def _quiet_opts(self) -> dict:
-        return {"quiet": True, "no_warnings": True}
+    def _cookies_opt(self, browser: str = "") -> dict:
+        if browser:
+            return {"cookiesfrombrowser": (browser.lower(),)}
+        return {}
+
+    def _quiet_opts(self, browser: str = "") -> dict:
+        return {"quiet": True, "no_warnings": True, **self._cookies_opt(browser)}
 
     def get_video_info(self, url: str) -> TrackInfo:
         import yt_dlp
@@ -84,12 +112,16 @@ class YouTubeService:
             )
         return tracks, playlist_name
 
-    def search_video(self, query: str, duration_ms: Optional[int] = None) -> List[str]:
+    def search_video(self, query: str, duration_ms: Optional[int] = None, cookies_browser: str = "") -> List[str]:
         """Search YouTube and return candidate URLs, best match first."""
         import yt_dlp
-        opts = {**self._quiet_opts(), "extract_flat": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+        opts = {**self._quiet_opts(cookies_browser), "extract_flat": True}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+        except Exception as exc:
+            _check_cookie_error(exc)
+            raise
 
         entries = [e for e in (results.get("entries") or []) if e and e.get("id")]
 
@@ -97,10 +129,10 @@ class YouTubeService:
             target_s = duration_ms / 1000
 
             def sort_key(e):
+                is_clean = bool(_CLEAN_RE.search(e.get("title", "")))
                 dur = e.get("duration")
-                if dur and abs(dur - target_s) < 30:
-                    return abs(dur - target_s)
-                return float("inf")
+                dur_diff = abs(dur - target_s) if dur and abs(dur - target_s) < 30 else float("inf")
+                return (is_clean, dur_diff)
 
             entries.sort(key=sort_key)
 
@@ -114,6 +146,7 @@ class YouTubeService:
         quality: str = "320",
         normalize: bool = False,
         on_progress: Optional[Callable[[float, str], None]] = None,
+        cookies_browser: str = "",
     ) -> str:
         """Download and convert audio. Returns actual output file path."""
         import yt_dlp
@@ -141,12 +174,11 @@ class YouTubeService:
             postprocessors.append({"key": "FFmpegNormalize"})
 
         ydl_opts = {
+            **self._quiet_opts(cookies_browser),
             "format": "bestaudio/best",
             "outtmpl": output_template,
             "postprocessors": postprocessors,
             "progress_hooks": [hook],
-            "quiet": True,
-            "no_warnings": True,
             "retries": 3,
             "fragment_retries": 3,
         }
@@ -174,6 +206,7 @@ class YouTubeService:
         thread.join()
 
         if error_box:
+            _check_cookie_error(error_box[0])
             raise error_box[0]
 
         # Resolve actual output path (yt-dlp replaces %(ext)s)
