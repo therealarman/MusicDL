@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.venv
 
 # Claude
 .claude/
@@ -63,3 +64,7 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+# Cookies — never commit; treat any previously committed version as compromised
+cookies.txt
+batch_cookies.txt

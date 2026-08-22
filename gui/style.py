@@ -328,6 +328,31 @@ QFrame[frameShape="5"] {{
     color: {BORDER};
 }}
 
+/* ── Splitter ─────────────────────────────────────────────────────────── */
+QSplitter::handle {{
+    background: {BORDER};
+}}
+QSplitter::handle:horizontal {{
+    width: 2px;
+}}
+QSplitter::handle:vertical {{
+    height: 2px;
+}}
+QSplitter::handle:hover {{
+    background: {ACCENT};
+}}
+
+/* ── Action toolbar / footer bar ──────────────────────────────────────── */
+QFrame#actionToolbar,
+QFrame#footerBar {{
+    background: {SURFACE};
+    border-top: 1px solid {BORDER};
+    border-bottom: none;
+}}
+QFrame#actionToolbar {{
+    border-bottom: 1px solid {BORDER};
+}}
+
 /* ── Status bar ───────────────────────────────────────────────────────── */
 QStatusBar {{
     background: {SURFACE};

@@ -40,12 +40,22 @@ Supports individual tracks, full playlists, and albums with metadata embedding a
 
 ---
 
+## Security notice — `cookies.txt`
+
+`cookies.txt` is **not tracked by this repository** and must never be committed.  
+If a `cookies.txt` was previously committed to your fork or clone, **treat that session as
+compromised**: the browser session it came from should be logged out and the cookies
+revoked immediately.  The file is now listed in `.gitignore`.
+
+---
+
 ## Requirements
 
 | Tool | Version | Notes |
 |------|---------|-------|
 | Python | 3.10+ | [python.org](https://python.org) |
 | ffmpeg | Any recent | Required for audio conversion |
+| Node.js | 18+ (optional) | Enables PO-token age-gate bypass via `js_runtimes` |
 | Git | Any | To clone the repo |
 
 ### Install ffmpeg (Windows)

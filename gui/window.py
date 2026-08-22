@@ -11,15 +11,15 @@ import requests
 from typing import Dict, List, Optional, Set
 
 from PyQt6.QtCore import (
-    QSettings, QSize, Qt, QThreadPool, QTimer, pyqtSlot,
+    QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal, pyqtSlot,
 )
-from PyQt6.QtGui import QFont, QIcon, QPixmap
+from PyQt6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMainWindow, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QStatusBar, QTableWidget, QTableWidgetItem,
+    QSizePolicy, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -78,12 +78,6 @@ STATUS_COLORS: Dict[str, tuple] = {
     "error":       ("rgba(248,81,73,0.15)",   ERROR),
     "cancelled":   ("rgba(139,148,158,0.15)", MUTED),
 }
-
-MEMORIAL_NAMES = [
-    "RIP JAY DEE", "RIP PROOF", "RIP BAATIN", "RIP PHIFE",
-    "RIP DOOM", "RIP AMP FIDDLER", "RIP ROY HARGROVE",
-    "RIP TRUGOY", "RIP ROY AYERS", "RIP BOB POWER",
-]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -183,7 +177,6 @@ class TrackProgressItem(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(5)
 
-        # Header row
         header = QHBoxLayout()
         header.setSpacing(8)
 
@@ -218,7 +211,6 @@ class TrackProgressItem(QFrame):
         header.addWidget(self.open_btn)
         layout.addLayout(header)
 
-        # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -226,7 +218,6 @@ class TrackProgressItem(QFrame):
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
 
-        # Message
         self.msg_lbl = QLabel("")
         self.msg_lbl.setStyleSheet(f"font-size: 11px; color: {MUTED};")
         layout.addWidget(self.msg_lbl)
@@ -287,7 +278,6 @@ class TrackProgressItem(QFrame):
             else:
                 subprocess.Popen(["xdg-open", folder])
         else:
-            # Fallback: open temp dir
             from backend.config import settings
             folder = settings.TEMP_DIR
             if sys.platform == "win32":
@@ -373,9 +363,316 @@ class _FlowLayout(QVBoxLayout):
         self.addLayout(row)
 
     def addWidget(self, widget, stretch=0, alignment=Qt.AlignmentFlag(0)):
-        if len(self._rows[-1].children()) >= 4:  # wrap after 4 per row
+        if len(self._rows[-1].children()) >= 4:
             self._add_row()
         self._current_row.addWidget(widget)
+
+
+# ── Per-batch progress dialog (non-modal, one per download batch) ─────────────
+
+class ProgressBatchDialog(QDialog):
+    """Opens alongside the main window for a single download batch."""
+
+    job_complete = pyqtSignal(str, list)  # job_id, list of history-entry dicts
+
+    def __init__(
+        self,
+        job_id: str,
+        tracks: List[dict],
+        base_url: str,
+        fmt: str,
+        parent=None,
+    ):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.job_id = job_id
+        self.tracks = tracks
+        self.base_url = base_url
+        self._fmt = fmt
+        self._save_folder: Optional[str] = None  # populated from first completed file_path
+        self.track_progress_widgets: Dict[str, TrackProgressItem] = {}
+        self._sse_worker: Optional[SSEWorker] = None
+        self._cancel_workers: List[CancelWorker] = []
+        self._build()
+        self._start_sse()
+
+    def _build(self):
+        n = len(self.tracks)
+        self.setWindowTitle(f"Downloading — {n} track{'s' if n != 1 else ''}")
+        self.resize(620, 520)
+        self.setMinimumWidth(500)
+        self.setStyleSheet(f"QDialog {{ background: {BG}; }}")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Header row
+        hdr = QHBoxLayout()
+        self._title_lbl = _label(f"Downloading {n} track{'s' if n != 1 else ''}…", color=TEXT, font_size=14)
+        self._title_lbl.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {TEXT};")
+        self._count_lbl = _label("", color=MUTED, font_size=11)
+        hdr.addWidget(self._title_lbl)
+        hdr.addStretch()
+        hdr.addWidget(self._count_lbl)
+        layout.addLayout(hdr)
+
+        # Overall progress bar
+        self._overall_bar = QProgressBar()
+        self._overall_bar.setRange(0, 100)
+        self._overall_bar.setValue(0)
+        self._overall_bar.setMaximumHeight(6)
+        self._overall_bar.setTextVisible(False)
+        layout.addWidget(self._overall_bar)
+
+        # Per-track scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"QScrollArea {{ background: transparent; border: none; }}")
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        self._track_layout = QVBoxLayout(content)
+        self._track_layout.setContentsMargins(0, 0, 0, 0)
+        self._track_layout.setSpacing(6)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        for track in self.tracks:
+            item = TrackProgressItem(track, self.job_id, self.base_url)
+            self.track_progress_widgets[track["id"]] = item
+            self._track_layout.addWidget(item)
+        self._track_layout.addStretch()
+
+        # Bottom row: cancel | open-folder | close
+        btn_row = QHBoxLayout()
+        self._cancel_btn = _btn("✕  Cancel", "danger")
+        self._cancel_btn.clicked.connect(self._cancel)
+        btn_row.addWidget(self._cancel_btn)
+        btn_row.addStretch()
+        self._open_folder_btn = _btn("📂  Open Folder", "secondary")
+        self._open_folder_btn.setEnabled(False)
+        self._open_folder_btn.setToolTip("Open the folder containing the downloaded files")
+        self._open_folder_btn.clicked.connect(self._open_save_folder)
+        btn_row.addWidget(self._open_folder_btn)
+        self._close_btn = _btn("Close", "secondary")
+        self._close_btn.clicked.connect(self.close)
+        btn_row.addWidget(self._close_btn)
+        layout.addLayout(btn_row)
+
+    def _start_sse(self):
+        self._sse_worker = SSEWorker(self.base_url, self.job_id)
+        self._sse_worker.track_update.connect(self._on_track_update)
+        self._sse_worker.job_update.connect(self._on_job_update)
+        self._sse_worker.log_message.connect(self._on_log)
+        self._sse_worker.start()
+
+    @pyqtSlot(dict)
+    def _on_track_update(self, data: dict):
+        tid = data.get("track_id", "")
+        pw = self.track_progress_widgets.get(tid)
+        if pw:
+            pw.update_progress(data)
+        # Latch the save folder as soon as any completed file_path arrives
+        if self._save_folder is None:
+            fp = data.get("file_path")
+            if fp:
+                self._save_folder = os.path.dirname(fp)
+                self._open_folder_btn.setEnabled(True)
+        self._refresh_overall()
+
+    def _open_save_folder(self):
+        if self._save_folder and os.path.isdir(self._save_folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_folder))
+
+    @pyqtSlot(dict)
+    def _on_job_update(self, data: dict):
+        status = data.get("status")
+        completed = data.get("completed_tracks", 0)
+        failed = data.get("failed_tracks", 0)
+        total = data.get("total_tracks", len(self.track_progress_widgets))
+
+        if total > 0:
+            self._overall_bar.setValue(int((completed / total) * 100))
+        self._count_lbl.setText(
+            f"{completed}/{total} done" + (f"  —  {failed} failed" if failed else "")
+        )
+
+        if status == "done":
+            self._overall_bar.setValue(100)
+            self.setWindowTitle(f"Complete — {completed} track{'s' if completed != 1 else ''} downloaded")
+            self._title_lbl.setText(f"Done! {completed} track{'s' if completed != 1 else ''} downloaded.")
+            self._cancel_btn.setEnabled(False)
+            self._emit_complete()
+        elif status == "cancelled":
+            self.setWindowTitle("Cancelled")
+            self._title_lbl.setText("Download cancelled.")
+            self._cancel_btn.setEnabled(False)
+
+    @pyqtSlot(str)
+    def _on_log(self, msg: str):
+        pass  # Could forward to status bar; currently swallowed
+
+    def _refresh_overall(self):
+        widgets = list(self.track_progress_widgets.values())
+        if not widgets:
+            return
+        completed = sum(1 for w in widgets if w.badge.text() == "done")
+        failed = sum(1 for w in widgets if w.badge.text() == "error")
+        total = len(widgets)
+        self._overall_bar.setValue(int((completed / total) * 100) if total else 0)
+        self._count_lbl.setText(
+            f"{completed}/{total} done" + (f"  —  {failed} failed" if failed else "")
+        )
+
+    def _emit_complete(self):
+        done_entries = []
+        ts = time.time()
+        for track in self.tracks:
+            pw = self.track_progress_widgets.get(track["id"])
+            if pw and pw.badge.text() == "done":
+                done_entries.append({
+                    "title": track.get("title", "?"),
+                    "artist": track.get("artist", "?"),
+                    "format": self._fmt,
+                    "timestamp": ts,
+                    "file_path": pw.file_path,
+                })
+        self.job_complete.emit(self.job_id, done_entries)
+
+    def _cancel(self):
+        w = CancelWorker(self.base_url, self.job_id)
+        self._cancel_workers.append(w)
+        w.start()
+        self._cancel_btn.setEnabled(False)
+
+    def closeEvent(self, event):
+        if self._sse_worker:
+            self._sse_worker.stop()
+        super().closeEvent(event)
+
+
+# ── History dialog ─────────────────────────────────────────────────────────────
+
+class HistoryDialog(QDialog):
+    """Pop-out window showing download history."""
+
+    history_cleared = pyqtSignal()
+
+    def __init__(self, history: List[dict], parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.history = history
+        self._build()
+
+    def _build(self):
+        self.setWindowTitle("Download History")
+        self.resize(500, 440)
+        self.setMinimumWidth(400)
+        self.setStyleSheet(f"QDialog {{ background: {BG}; }}")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Header
+        hdr = QHBoxLayout()
+        hdr.addWidget(_label("DOWNLOAD HISTORY", color=MUTED, font_size=11))
+        hdr.addStretch()
+        clear_btn = _btn("Clear All", "danger", "sm")
+        clear_btn.clicked.connect(self._clear)
+        hdr.addWidget(clear_btn)
+        layout.addLayout(hdr)
+
+        # Scrollable list
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"QScrollArea {{ background: transparent; border: none; }}")
+        self._list_widget = QWidget()
+        self._list_widget.setStyleSheet("background: transparent;")
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(4)
+        scroll.setWidget(self._list_widget)
+        layout.addWidget(scroll, 1)
+
+        self._populate()
+
+        # Close
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = _btn("Close", "secondary")
+        close_btn.clicked.connect(self.close)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def _populate(self):
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self.history:
+            empty = _label("No downloads yet.", color=MUTED)
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._list_layout.addWidget(empty)
+            self._list_layout.addStretch()
+            return
+
+        for entry in self.history[:50]:
+            row_lay = QHBoxLayout()
+            row_lay.setSpacing(10)
+
+            info = QVBoxLayout()
+            info.setSpacing(1)
+            title_lbl = QLabel(entry.get("title", "?"))
+            title_lbl.setStyleSheet(f"font-size: 12px; font-weight: 500; color: {TEXT};")
+            title_lbl.setWordWrap(False)
+            title_lbl.setTextFormat(Qt.TextFormat.PlainText)
+
+            ts = entry.get("timestamp", 0)
+            time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
+            meta_lbl = QLabel(
+                f"{entry.get('artist', '?')}  ·  {entry.get('format', '').upper()}  ·  {time_str}"
+            )
+            meta_lbl.setStyleSheet(f"font-size: 11px; color: {MUTED};")
+            info.addWidget(title_lbl)
+            info.addWidget(meta_lbl)
+
+            open_btn = QPushButton("📂")
+            open_btn.setFixedSize(28, 28)
+            open_btn.setStyleSheet(
+                f"QPushButton {{ background: {SURFACE2}; border: 1px solid {BORDER};"
+                f"border-radius: 4px; font-size: 13px; }}"
+                f"QPushButton:hover {{ border-color: {ACCENT}; }}"
+            )
+            fp = entry.get("file_path")
+            if fp and os.path.exists(fp):
+                open_btn.setToolTip("Open in Explorer")
+                open_btn.clicked.connect(lambda _, p=fp: self._open_file(p))
+            else:
+                open_btn.setEnabled(False)
+                open_btn.setToolTip("File no longer available")
+
+            row_lay.addLayout(info, 1)
+            row_lay.addWidget(open_btn)
+
+            wrap = QWidget()
+            wrap.setStyleSheet("background: transparent;")
+            wrap.setLayout(row_lay)
+            self._list_layout.addWidget(wrap)
+
+        self._list_layout.addStretch()
+
+    def _clear(self):
+        self.history.clear()
+        self.history_cleared.emit()
+        self._populate()
+
+    def _open_file(self, path: str):
+        if sys.platform == "win32":
+            subprocess.Popen(f'explorer /select,"{path}"')
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
 
 
 # ── Main Window ────────────────────────────────────────────────────────────────
@@ -385,29 +682,32 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.base_url = base_url
 
-        # State
+        # Track state
         self.tracks: List[dict] = []
         self.selected_ids: Set[str] = set()
-        self.active_job_id: Optional[str] = None
-        self.job_status: Optional[str] = None
-        self.track_progress_widgets: Dict[str, TrackProgressItem] = {}
         self.history: List[dict] = []
+
+        # Last completed job (for ZIP)
+        self._active_job_id: Optional[str] = None
+
+        # Running batch dialogs keyed by job_id
+        self._batch_dialogs: Dict[str, ProgressBatchDialog] = {}
+
+        # Keep DownloadStartWorker refs alive until threads finish
+        self._active_workers: Set = set()
 
         # Settings
         self._settings = QSettings("MusicDL", "MusicDL")
         self._load_settings()
 
-        # Workers (kept as attrs to prevent GC)
+        # Workers kept alive to prevent GC
         self._server_worker: Optional[ServerWaitWorker] = None
         self._fetch_worker: Optional[FetchWorker] = None
-        self._dl_worker: Optional[DownloadStartWorker] = None
-        self._sse_worker: Optional[SSEWorker] = None
-        self._cancel_worker: Optional[CancelWorker] = None
 
-        # Image thread pool
+        # Image loading pool
         self._image_pool = QThreadPool()
         self._image_pool.setMaxThreadCount(4)
-        self._art_labels: Dict[str, QLabel] = {}  # track_id -> QLabel in table
+        self._art_labels: Dict[str, QLabel] = {}
 
         self._build_ui()
         self._set_server_ready(False)
@@ -445,14 +745,19 @@ class MainWindow(QMainWindow):
         import json
         self._settings.setValue("history", json.dumps(self.history[:50]))
 
+    def _save_column_widths(self):
+        self._settings.setValue(
+            "track_table_header_state",
+            self.track_table.horizontalHeader().saveState(),
+        )
+
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self.setWindowTitle("MusicDL")
-        self.setMinimumSize(820, 600)
-        self.resize(960, 800)
+        self.setMinimumSize(820, 640)
+        self.resize(960, 840)
 
-        # Try to set window icon
         icon_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "frontend", "icons", "icon.png"
         )
@@ -469,52 +774,23 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(0)
 
         # Header bar
-        header = self._build_header()
-        root_layout.addWidget(header)
+        root_layout.addWidget(self._build_header())
 
-        # Scroll area
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet(f"QScrollArea {{ background: {BG}; border: none; }}")
+        # ── Splitter: top = settings, bottom = track staging ──────────────────
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setObjectName("mainSplitter")
+        self.splitter.setHandleWidth(2)
+        self.splitter.setChildrenCollapsible(False)
 
-        self.scroll_content = QWidget()
-        self.scroll_content.setStyleSheet(f"background: {BG};")
-        self.content_layout = QVBoxLayout(self.scroll_content)
-        self.content_layout.setContentsMargins(20, 16, 20, 20)
-        self.content_layout.setSpacing(10)
+        self.splitter.addWidget(self._build_settings_pane())
+        self.splitter.addWidget(self._build_track_pane())
 
-        self.scroll.setWidget(self.scroll_content)
-        root_layout.addWidget(self.scroll, 1)
+        self.splitter.setSizes([340, 500])
 
-        # Cards
-        self.url_card = self._build_url_card()
-        self.template_card = self._build_template_card()
-        self.settings_card = self._build_settings_card()
-        self.track_card = self._build_track_card()
-        self.actions_card = self._build_actions_card()
-        self.progress_card = self._build_progress_card()
-        self.history_card = self._build_history_card()
-        self.memorial_widget = self._build_memorial()
+        root_layout.addWidget(self.splitter, 1)
 
-        for w in [
-            self.url_card,
-            self.template_card,
-            self.settings_card,
-            self.track_card,
-            self.actions_card,
-            self.progress_card,
-            self.history_card,
-            self.memorial_widget,
-        ]:
-            self.content_layout.addWidget(w)
-
-        self.content_layout.addStretch(1)
-
-        self.track_card.setVisible(False)
-        self.actions_card.setVisible(False)
-        self.progress_card.setVisible(False)
-        self.history_card.setVisible(len(self.history) > 0)
+        # Footer bar (outside splitter, pinned to bottom)
+        root_layout.addWidget(self._build_footer_bar())
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -568,6 +844,153 @@ class MainWindow(QMainWindow):
 
         return header
 
+    # ── Settings pane (top half of splitter) ───────────────────────────────────
+
+    def _build_settings_pane(self) -> QScrollArea:
+        """Scrollable top pane: URL + filename template + audio settings."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"QScrollArea {{ background: {BG}; border: none; }}")
+
+        content = QWidget()
+        content.setStyleSheet(f"background: {BG};")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(20, 16, 20, 12)
+        layout.setSpacing(10)
+
+        self.url_card = self._build_url_card()
+        self.template_card = self._build_template_card()
+        self.settings_card = self._build_settings_card()
+
+        layout.addWidget(self.url_card)
+        layout.addWidget(self.template_card)
+        layout.addWidget(self.settings_card)
+        layout.addStretch()
+
+        scroll.setWidget(content)
+        return scroll
+
+    # ── Track staging pane (bottom half of splitter) ───────────────────────────
+
+    def _build_track_pane(self) -> QWidget:
+        """Bottom pane: action toolbar + track staging area."""
+        pane = QWidget()
+        pane.setStyleSheet(f"background: {BG};")
+        outer = QVBoxLayout(pane)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Action toolbar (between the panes) ─────────────────────────────────
+        self.action_toolbar = QFrame()
+        self.action_toolbar.setObjectName("actionToolbar")
+        self.action_toolbar.setFixedHeight(52)
+        toolbar_layout = QHBoxLayout(self.action_toolbar)
+        toolbar_layout.setContentsMargins(20, 8, 20, 8)
+        toolbar_layout.setSpacing(10)
+
+        self.dl_all_btn = _btn("↓  Download All (0)", "secondary")
+        self.dl_all_btn.setEnabled(False)
+        self.dl_all_btn.clicked.connect(self._download_all)
+
+        self.dl_selected_btn = _btn("↓  Download Selected (0)", "primary")
+        self.dl_selected_btn.setEnabled(False)
+        self.dl_selected_btn.clicked.connect(self._download_selected)
+
+        toolbar_layout.addWidget(self.dl_all_btn)
+        toolbar_layout.addWidget(self.dl_selected_btn)
+        toolbar_layout.addStretch()
+        outer.addWidget(self.action_toolbar)
+
+        # ── Track staging content ──────────────────────────────────────────────
+        staging = QWidget()
+        staging.setStyleSheet(f"background: {BG};")
+        staging_layout = QVBoxLayout(staging)
+        staging_layout.setContentsMargins(20, 12, 20, 12)
+        staging_layout.setSpacing(8)
+
+        # Header row: playlist title + selection count
+        hdr = QHBoxLayout()
+        self.track_card_title = _label("TRACKS", color=MUTED, font_size=11)
+        self.track_count_lbl = _label("0 selected", color=MUTED, font_size=11)
+        hdr.addWidget(self.track_card_title)
+        hdr.addStretch()
+        hdr.addWidget(self.track_count_lbl)
+        staging_layout.addLayout(hdr)
+
+        # Selection controls
+        ctrl = QHBoxLayout()
+        self.select_all_btn = _btn("Select All", "secondary", "sm")
+        self.select_all_btn.setFixedWidth(90)
+        self.select_all_btn.setEnabled(False)
+        self.select_all_btn.clicked.connect(self._toggle_select_all)
+        self.invert_btn = _btn("Invert", "secondary", "sm")
+        self.invert_btn.setFixedWidth(70)
+        self.invert_btn.setEnabled(False)
+        self.invert_btn.clicked.connect(self._invert_selection)
+        ctrl.addWidget(self.select_all_btn)
+        ctrl.addWidget(self.invert_btn)
+        ctrl.addStretch()
+        staging_layout.addLayout(ctrl)
+
+        # Track table
+        self.track_table = QTableWidget()
+        self.track_table.setColumnCount(7)
+        self.track_table.setHorizontalHeaderLabels(["", "#", "", "Title", "Artist", "Album", "Duration"])
+        self.track_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.track_table.verticalHeader().setVisible(False)
+        self.track_table.setShowGrid(False)
+        self.track_table.setWordWrap(False)
+        self.track_table.setAlternatingRowColors(False)
+        self.track_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        hh = self.track_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        hh.setStretchLastSection(False)
+        self.track_table.setColumnWidth(0, 38)
+        self.track_table.setColumnWidth(1, 36)
+        self.track_table.setColumnWidth(2, 50)
+        self.track_table.setColumnWidth(6, 70)
+        self.track_table.verticalHeader().setDefaultSectionSize(44)
+
+        staging_layout.addWidget(self.track_table, 1)
+        outer.addWidget(staging, 1)
+
+        return pane
+
+    # ── Footer bar (pinned at window bottom) ───────────────────────────────────
+
+    def _build_footer_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("footerBar")
+        bar.setFixedHeight(52)
+        bar.setStyleSheet(
+            f"QFrame#footerBar {{ background: {SURFACE}; border-top: 1px solid {BORDER}; }}"
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(20, 8, 20, 8)
+        layout.setSpacing(10)
+
+        self.zip_btn = _btn("⊞  Download ZIP", "secondary")
+        self.zip_btn.setVisible(False)
+        self.zip_btn.clicked.connect(self._save_zip)
+
+        self.history_btn = _btn("History", "secondary")
+        self.history_btn.clicked.connect(self._open_history_dialog)
+
+        layout.addWidget(self.zip_btn)
+        layout.addStretch()
+        layout.addWidget(self.history_btn)
+
+        return bar
+
     # ── URL Card ───────────────────────────────────────────────────────────────
 
     def _build_url_card(self) -> QFrame:
@@ -576,13 +999,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        # Card header row
         hdr = QHBoxLayout()
         hdr.addWidget(_label("URL", color=MUTED, font_size=11))
         hdr.addStretch()
         layout.addLayout(hdr)
 
-        # URL row
         url_row = QHBoxLayout()
         url_row.setSpacing(8)
 
@@ -621,7 +1042,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        # Header row
         hdr = QHBoxLayout()
         hdr.addWidget(_label("FILENAME TEMPLATE", color=MUTED, font_size=11))
         hdr.addStretch()
@@ -631,7 +1051,6 @@ class MainWindow(QMainWindow):
         hdr.addWidget(self.tokens_btn)
         layout.addLayout(hdr)
 
-        # Preset + input row
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
 
@@ -650,7 +1069,6 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self.template_input, 1)
         layout.addLayout(input_row)
 
-        # Preview
         preview_row = QHBoxLayout()
         preview_row.setSpacing(4)
         preview_row.addWidget(_label("Preview:", color=MUTED, font_size=11))
@@ -675,11 +1093,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(_label("AUDIO SETTINGS", color=MUTED, font_size=11))
 
-        # Row: format + quality + browser
         selects_row = QHBoxLayout()
         selects_row.setSpacing(16)
 
-        # Format
         fmt_col = QVBoxLayout()
         fmt_col.setSpacing(4)
         fmt_col.addWidget(_label("FORMAT", color=MUTED, font_size=10))
@@ -690,7 +1106,6 @@ class MainWindow(QMainWindow):
         self.format_combo.currentIndexChanged.connect(self._on_format_changed)
         fmt_col.addWidget(self.format_combo)
 
-        # Bitrate
         q_col = QVBoxLayout()
         q_col.setSpacing(4)
         q_col.addWidget(_label("BITRATE", color=MUTED, font_size=10))
@@ -702,7 +1117,6 @@ class MainWindow(QMainWindow):
         self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         q_col.addWidget(self.quality_combo)
 
-        # Browser (cookies)
         br_col = QVBoxLayout()
         br_col.setSpacing(4)
         br_lbl_row = QHBoxLayout()
@@ -746,25 +1160,21 @@ class MainWindow(QMainWindow):
         selects_row.addStretch()
         layout.addLayout(selects_row)
 
-        # Checkboxes row
         checks = QHBoxLayout()
         checks.setSpacing(20)
-
         self.normalize_chk = QCheckBox("Normalize audio levels (ffmpeg loudnorm)")
         self.normalize_chk.setChecked(self.normalize)
         self.normalize_chk.stateChanged.connect(self._on_normalize_changed)
-
         self.embed_art_chk = QCheckBox("Embed album artwork")
         self.embed_art_chk.setChecked(self.embed_art)
         self.embed_art_chk.stateChanged.connect(self._on_embed_art_changed)
-
         checks.addWidget(self.normalize_chk)
         checks.addWidget(self.embed_art_chk)
         checks.addStretch()
         layout.addLayout(checks)
 
-        # Download location row
         layout.addWidget(_hline())
+
         loc_row = QHBoxLayout()
         loc_row.setSpacing(8)
         loc_row.addWidget(_label("SAVE TO", color=MUTED, font_size=10))
@@ -801,187 +1211,6 @@ class MainWindow(QMainWindow):
 
         return card
 
-    # ── Track Table Card ───────────────────────────────────────────────────────
-
-    def _build_track_card(self) -> QFrame:
-        card = _card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-
-        # Header row
-        hdr = QHBoxLayout()
-        self.track_card_title = _label("TRACKS", color=MUTED, font_size=11)
-        self.track_count_lbl = _label("0 selected", color=MUTED, font_size=11)
-        hdr.addWidget(self.track_card_title)
-        hdr.addStretch()
-        hdr.addWidget(self.track_count_lbl)
-        layout.addLayout(hdr)
-
-        # Control row
-        ctrl = QHBoxLayout()
-        ctrl.setSpacing(8)
-        self.select_all_btn = _btn("Select All", "secondary", "sm")
-        self.select_all_btn.setFixedWidth(90)
-        self.select_all_btn.clicked.connect(self._toggle_select_all)
-        self.invert_btn = _btn("Invert", "secondary", "sm")
-        self.invert_btn.setFixedWidth(70)
-        self.invert_btn.clicked.connect(self._invert_selection)
-        ctrl.addWidget(self.select_all_btn)
-        ctrl.addWidget(self.invert_btn)
-        ctrl.addStretch()
-        layout.addLayout(ctrl)
-
-        # Table
-        self.track_table = QTableWidget()
-        self.track_table.setColumnCount(7)
-        self.track_table.setHorizontalHeaderLabels(["", "#", "", "Title", "Artist", "Album", "Duration"])
-        self.track_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.track_table.verticalHeader().setVisible(False)
-        self.track_table.setShowGrid(False)
-        self.track_table.setWordWrap(False)
-        self.track_table.setAlternatingRowColors(False)
-        self.track_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-
-        hh = self.track_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.track_table.setColumnWidth(0, 38)
-        self.track_table.setColumnWidth(1, 36)
-        self.track_table.setColumnWidth(2, 46)
-        self.track_table.setColumnWidth(6, 60)
-
-        self.track_table.verticalHeader().setDefaultSectionSize(44)
-        self.track_table.setMinimumHeight(100)
-        layout.addWidget(self.track_table)
-
-        self.track_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        return card
-
-    # ── Actions Card ───────────────────────────────────────────────────────────
-
-    def _build_actions_card(self) -> QFrame:
-        card = _card()
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(10)
-
-        self.dl_selected_btn = _btn("↓  Download Selected (0)", "primary")
-        self.dl_selected_btn.clicked.connect(self._download_selected)
-
-        self.dl_all_btn = _btn("↓  Download All (0)", "secondary")
-        self.dl_all_btn.clicked.connect(self._download_all)
-
-        self.cancel_btn = _btn("✕  Cancel", "danger")
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.clicked.connect(self._cancel_download)
-
-        self.zip_btn = _btn("⊞  Save ZIP", "secondary")
-        self.zip_btn.setVisible(False)
-        self.zip_btn.clicked.connect(self._save_zip)
-
-        layout.addWidget(self.dl_selected_btn)
-        layout.addWidget(self.dl_all_btn)
-        layout.addWidget(self.cancel_btn)
-        layout.addWidget(self.zip_btn)
-        layout.addStretch()
-
-        return card
-
-    # ── Progress Card ──────────────────────────────────────────────────────────
-
-    def _build_progress_card(self) -> QFrame:
-        card = _card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-
-        # Header
-        hdr = QHBoxLayout()
-        self.progress_title = _label("PROGRESS", color=MUTED, font_size=11)
-        self.progress_count_lbl = _label("", color=MUTED, font_size=11)
-        hdr.addWidget(self.progress_title)
-        hdr.addStretch()
-        hdr.addWidget(self.progress_count_lbl)
-        layout.addLayout(hdr)
-
-        # Overall bar
-        self.overall_bar = QProgressBar()
-        self.overall_bar.setRange(0, 100)
-        self.overall_bar.setValue(0)
-        self.overall_bar.setMaximumHeight(6)
-        self.overall_bar.setTextVisible(False)
-        layout.addWidget(self.overall_bar)
-
-        # Per-track scroll area
-        self.track_progress_scroll = QScrollArea()
-        self.track_progress_scroll.setWidgetResizable(True)
-        self.track_progress_scroll.setMaximumHeight(320)
-        self.track_progress_scroll.setStyleSheet(
-            f"QScrollArea {{ background: transparent; border: none; }}"
-        )
-
-        self.track_progress_content = QWidget()
-        self.track_progress_content.setStyleSheet("background: transparent;")
-        self.track_progress_layout = QVBoxLayout(self.track_progress_content)
-        self.track_progress_layout.setContentsMargins(0, 0, 0, 0)
-        self.track_progress_layout.setSpacing(6)
-        self.track_progress_scroll.setWidget(self.track_progress_content)
-        layout.addWidget(self.track_progress_scroll)
-
-        return card
-
-    # ── History Card ───────────────────────────────────────────────────────────
-
-    def _build_history_card(self) -> QFrame:
-        card = _card()
-        self._history_card_layout = QVBoxLayout(card)
-        self._history_card_layout.setContentsMargins(16, 14, 16, 14)
-        self._history_card_layout.setSpacing(8)
-
-        hdr = QHBoxLayout()
-        hdr.addWidget(_label("DOWNLOAD HISTORY", color=MUTED, font_size=11))
-        hdr.addStretch()
-        clear_btn = _btn("Clear", "secondary", "sm")
-        clear_btn.setFixedWidth(60)
-        clear_btn.clicked.connect(self._clear_history)
-        hdr.addWidget(clear_btn)
-        self._history_card_layout.addLayout(hdr)
-
-        self._history_list_widget = QWidget()
-        self._history_list_widget.setStyleSheet("background: transparent;")
-        self._history_list_layout = QVBoxLayout(self._history_list_widget)
-        self._history_list_layout.setContentsMargins(0, 0, 0, 0)
-        self._history_list_layout.setSpacing(2)
-        self._history_card_layout.addWidget(self._history_list_widget)
-
-        self._rebuild_history_ui()
-        return card
-
-    # ── Memorial ────────────────────────────────────────────────────────────────
-
-    def _build_memorial(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 16, 0, 8)
-        layout.setSpacing(4)
-        for name in MEMORIAL_NAMES:
-            lbl = QLabel(name)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet(
-                f"color: {MUTED}; font-size: 10px; font-weight: 600;"
-                f"letter-spacing: 2px; opacity: 0.5;"
-            )
-            layout.addWidget(lbl)
-        return w
-
     # ── Server readiness ───────────────────────────────────────────────────────
 
     def _start_server_wait(self):
@@ -995,20 +1224,16 @@ class MainWindow(QMainWindow):
         if not ready:
             self._notify("Backend failed to start — check console for errors.", "error")
             return
-        # Fetch health to check for warnings (Spotify config, ffmpeg, etc.)
         try:
             health = requests.get(f"{self.base_url}/api/health", timeout=5).json()
             checks = health.get("checks", {})
             warnings = health.get("warnings", [])
             spotify_ok = checks.get("spotify_configured", False)
             self.spotify_btn.setVisible(True)
-            if spotify_ok:
-                self.spotify_btn.setText("Reconnect Spotify")
-            else:
-                self.spotify_btn.setText("Connect Spotify")
+            self.spotify_btn.setText("Reconnect Spotify" if spotify_ok else "Connect Spotify")
             for w in warnings:
                 self._notify(w, "warn")
-                break  # show first warning; user can reconnect as needed
+                break
             if not warnings:
                 self._notify("Ready.", "info")
         except Exception:
@@ -1042,8 +1267,6 @@ class MainWindow(QMainWindow):
         self.fetch_btn.setText("Fetching…")
         self.tracks = []
         self.selected_ids.clear()
-        self.track_card.setVisible(False)
-        self.actions_card.setVisible(False)
         self._art_labels.clear()
 
         self._fetch_worker = FetchWorker(url, self.base_url)
@@ -1063,7 +1286,7 @@ class MainWindow(QMainWindow):
         if playlist:
             self.track_card_title.setText(f"  {playlist}  —  {count} TRACKS")
         else:
-            self.track_card_title.setText(f"TRACKS")
+            self.track_card_title.setText("TRACKS")
 
         if not self.tracks:
             self._notify("No tracks found for this URL.", "warn")
@@ -1072,11 +1295,7 @@ class MainWindow(QMainWindow):
         self._notify(f"Found {count} track{'s' if count != 1 else ''}.", "info")
         self._rebuild_track_table()
         self._update_actions()
-        self.track_card.setVisible(True)
-        self.actions_card.setVisible(True)
         self._update_preview()
-
-        # Load album art images
         self._load_images()
 
     @pyqtSlot(str)
@@ -1103,20 +1322,23 @@ class MainWindow(QMainWindow):
             selected = tid in self.selected_ids
             table.setRowHeight(row, 44)
 
-            # Col 0: Checkbox
             cb = QCheckBox()
             cb.setChecked(selected)
             cb.setStyleSheet(
-                f"QCheckBox {{ margin-left: 10px; }}"
                 f"QCheckBox::indicator {{ width: 15px; height: 15px; }}"
                 f"QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}"
             )
             cb.stateChanged.connect(
                 lambda state, t=tid: self._on_track_check_changed(t, state)
             )
-            table.setCellWidget(row, 0, cb)
+            cb_wrap = QWidget()
+            cb_wrap.setStyleSheet("background: transparent;")
+            cb_lay = QHBoxLayout(cb_wrap)
+            cb_lay.setContentsMargins(0, 0, 0, 0)
+            cb_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cb_lay.addWidget(cb)
+            table.setCellWidget(row, 0, cb_wrap)
 
-            # Col 1: Track number
             num = track.get("playlist_index") or (row + 1)
             num_item = QTableWidgetItem(str(num))
             num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1124,19 +1346,11 @@ class MainWindow(QMainWindow):
             num_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(row, 1, num_item)
 
-            # Col 2: Album art
             art_lbl = QLabel()
             art_lbl.setFixedSize(36, 36)
-            art_lbl.setStyleSheet(
-                f"background: {BORDER}; border-radius: 4px;"
-            )
+            art_lbl.setStyleSheet(f"background: {BORDER}; border-radius: 4px; color: {MUTED}; font-size: 14px;")
             art_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             art_lbl.setText("♪")
-            art_lbl.setStyleSheet(
-                f"background: {BORDER}; border-radius: 4px;"
-                f"color: {MUTED}; font-size: 14px;"
-            )
-            # Center in cell
             art_wrap = QWidget()
             art_wrap.setStyleSheet("background: transparent;")
             aw = QHBoxLayout(art_wrap)
@@ -1145,7 +1359,6 @@ class MainWindow(QMainWindow):
             table.setCellWidget(row, 2, art_wrap)
             self._art_labels[tid] = art_lbl
 
-            # Col 3-5: Title, Artist, Album
             for col, key in [(3, "title"), (4, "artist"), (5, "album")]:
                 val = track.get(key, "") or "—"
                 item = QTableWidgetItem(val)
@@ -1154,7 +1367,6 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor(MUTED))
                 table.setItem(row, col, item)
 
-            # Col 6: Duration
             dur = _fmt_duration(track.get("duration_ms", 0))
             dur_item = QTableWidgetItem(dur)
             dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1163,6 +1375,10 @@ class MainWindow(QMainWindow):
             table.setItem(row, 6, dur_item)
 
         table.blockSignals(False)
+
+        # Enable selection controls now that tracks are loaded
+        self.select_all_btn.setEnabled(True)
+        self.invert_btn.setEnabled(True)
         self._update_selection_ui()
 
     def _on_track_check_changed(self, track_id: str, state: int):
@@ -1230,14 +1446,10 @@ class MainWindow(QMainWindow):
     def _update_actions(self):
         sel = len(self.selected_ids)
         total = len(self.tracks)
-        running = self.job_status == "running"
-
         self.dl_selected_btn.setText(f"↓  Download Selected ({sel})")
-        self.dl_selected_btn.setEnabled(sel > 0 and not running)
+        self.dl_selected_btn.setEnabled(sel > 0)
         self.dl_all_btn.setText(f"↓  Download All ({total})")
-        self.dl_all_btn.setEnabled(total > 0 and not running)
-        self.cancel_btn.setVisible(running)
-        self.zip_btn.setVisible(self.job_status == "done" and self.active_job_id is not None)
+        self.dl_all_btn.setEnabled(total > 0)
 
     def _download_selected(self):
         tracks = [t for t in self.tracks if t["id"] in self.selected_ids]
@@ -1252,28 +1464,7 @@ class MainWindow(QMainWindow):
         self._start_download(self.tracks)
 
     def _start_download(self, tracks: List[dict]):
-        self.job_status = "running"
-        self.active_job_id = None
-        self.track_progress_widgets.clear()
-
-        # Clear progress UI
-        while self.track_progress_layout.count():
-            item = self.track_progress_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # Create progress items
-        for track in tracks:
-            item_widget = TrackProgressItem(track, "", self.base_url)
-            self.track_progress_widgets[track["id"]] = item_widget
-            self.track_progress_layout.addWidget(item_widget)
-
-        self.track_progress_layout.addStretch()
-        self.overall_bar.setValue(0)
-        self.progress_title.setText("PROGRESS — Downloading…")
-        self.progress_card.setVisible(True)
-        self._update_actions()
-
+        fmt_snapshot = self.fmt
         payload = {
             "tracks": tracks,
             "settings": {
@@ -1288,101 +1479,45 @@ class MainWindow(QMainWindow):
             },
         }
 
-        self._dl_worker = DownloadStartWorker(self.base_url, payload)
-        self._dl_worker.started.connect(self._on_download_started)
-        self._dl_worker.error.connect(self._on_download_error)
-        self._dl_worker.start()
+        worker = DownloadStartWorker(self.base_url, payload)
+        worker.started.connect(
+            lambda job_id, t=tracks, f=fmt_snapshot: self._on_batch_started(job_id, t, f)
+        )
+        worker.error.connect(self._on_download_error)
+        self._active_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._active_workers.discard(w))
+        worker.start()
 
     @pyqtSlot(str)
-    def _on_download_started(self, job_id: str):
-        self.active_job_id = job_id
-        # Update progress items with job_id
-        for pw in self.track_progress_widgets.values():
-            pw.job_id = job_id
-
-        if self._sse_worker:
-            self._sse_worker.stop()
-        self._sse_worker = SSEWorker(self.base_url, job_id)
-        self._sse_worker.track_update.connect(self._on_track_update)
-        self._sse_worker.job_update.connect(self._on_job_update)
-        self._sse_worker.log_message.connect(self._on_log_message)
-        self._sse_worker.finished_sse.connect(self._on_sse_finished)
-        self._sse_worker.start()
+    def _on_batch_started(self, job_id: str, tracks: list, fmt: str):
+        dlg = ProgressBatchDialog(job_id, tracks, self.base_url, fmt, self)
+        dlg.job_complete.connect(self._on_batch_complete)
+        dlg.setWindowFlag(Qt.WindowType.Window, True)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(lambda: self._batch_dialogs.pop(job_id, None))
+        dlg.show()
+        self._batch_dialogs[job_id] = dlg
+        self._notify(
+            f"Download started — {len(tracks)} track{'s' if len(tracks) != 1 else ''}. "
+            "Progress window is open.",
+            "info",
+        )
 
     @pyqtSlot(str)
     def _on_download_error(self, msg: str):
-        self.job_status = None
         self._notify(f"Download error: {msg}", "error")
-        self._update_actions()
 
-    @pyqtSlot(dict)
-    def _on_track_update(self, data: dict):
-        tid = data.get("track_id", "")
-        pw = self.track_progress_widgets.get(tid)
-        if pw:
-            pw.update_progress(data)
-        self._update_overall_progress()
-
-    @pyqtSlot(dict)
-    def _on_job_update(self, data: dict):
-        status = data.get("status")
-        completed = data.get("completed_tracks", 0)
-        failed = data.get("failed_tracks", 0)
-        total = data.get("total_tracks", len(self.track_progress_widgets))
-
-        if total > 0:
-            pct = int((completed / total) * 100)
-            self.overall_bar.setValue(pct)
-        self.progress_count_lbl.setText(
-            f"{completed}/{total} complete" + (f" — {failed} failed" if failed else "")
-        )
-
-        if status == "done":
-            self.job_status = "done"
-            self.progress_title.setText("PROGRESS — Complete")
-            self.overall_bar.setValue(100)
-            self._notify(
-                f"Download complete! {completed} tracks done"
-                + (f", {failed} failed" if failed else "."),
-                "info"
-            )
-            self._update_actions()
-            self._add_done_tracks_to_history()
-        elif status == "cancelled":
-            self.job_status = "cancelled"
-            self.progress_title.setText("PROGRESS — Cancelled")
-            self._notify("Download cancelled.", "warn")
-            self._update_actions()
-
-    @pyqtSlot(str)
-    def _on_log_message(self, msg: str):
-        self.status_bar.showMessage(f"⚠  {msg}", 8000)
-
-    @pyqtSlot()
-    def _on_sse_finished(self):
-        pass  # SSE stream ended
-
-    def _update_overall_progress(self):
-        widgets = list(self.track_progress_widgets.values())
-        if not widgets:
-            return
-        completed = sum(1 for w in widgets if w.badge.text() == "done")
-        failed = sum(1 for w in widgets if w.badge.text() == "error")
-        total = len(widgets)
-        pct = int((completed / total) * 100) if total else 0
-        self.overall_bar.setValue(pct)
-        self.progress_count_lbl.setText(
-            f"{completed}/{total} complete" + (f" — {failed} failed" if failed else "")
-        )
-
-    def _cancel_download(self):
-        if not self.active_job_id:
-            return
-        self._cancel_worker = CancelWorker(self.base_url, self.active_job_id)
-        self._cancel_worker.start()
+    @pyqtSlot(str, list)
+    def _on_batch_complete(self, job_id: str, done_entries: list):
+        self._active_job_id = job_id
+        self.zip_btn.setVisible(True)
+        for entry in done_entries:
+            self.history.insert(0, entry)
+        self.history = self.history[:50]
+        self._save_history()
 
     def _save_zip(self):
-        if not self.active_job_id:
+        if not self._active_job_id:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save ZIP", "music_download.zip", "ZIP Archive (*.zip)"
@@ -1390,7 +1525,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            r = requests.get(f"{self.base_url}/api/batch/{self.active_job_id}", timeout=60)
+            r = requests.get(f"{self.base_url}/api/batch/{self._active_job_id}", timeout=60)
             if r.ok:
                 with open(path, "wb") as f:
                     f.write(r.content)
@@ -1404,85 +1539,11 @@ class MainWindow(QMainWindow):
 
     # ── History ────────────────────────────────────────────────────────────────
 
-    def _add_done_tracks_to_history(self):
-        for track in self.tracks:
-            pw = self.track_progress_widgets.get(track["id"])
-            if pw and pw.badge.text() == "done":
-                self.history.insert(0, {
-                    "title": track.get("title", "?"),
-                    "artist": track.get("artist", "?"),
-                    "format": self.fmt,
-                    "timestamp": time.time(),
-                    "file_path": pw.file_path,
-                })
-        self._save_history()
-        self._rebuild_history_ui()
-        self.history_card.setVisible(True)
-
-    def _rebuild_history_ui(self):
-        # Clear old items
-        while self._history_list_layout.count():
-            item = self._history_list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for entry in self.history[:20]:
-            row = QHBoxLayout()
-            row.setSpacing(10)
-
-            info = QVBoxLayout()
-            info.setSpacing(1)
-            title_lbl = QLabel(entry.get("title", "?"))
-            title_lbl.setStyleSheet(f"font-size: 12px; font-weight: 500; color: {TEXT};")
-            title_lbl.setWordWrap(False)
-            title_lbl.setTextFormat(Qt.TextFormat.PlainText)
-
-            ts = entry.get("timestamp", 0)
-            time_str = time.strftime("%H:%M", time.localtime(ts)) if ts else ""
-            meta_lbl = QLabel(
-                f"{entry.get('artist', '?')}  ·  {entry.get('format', '').upper()}  ·  {time_str}"
-            )
-            meta_lbl.setStyleSheet(f"font-size: 11px; color: {MUTED};")
-
-            info.addWidget(title_lbl)
-            info.addWidget(meta_lbl)
-
-            open_btn = QPushButton("📂")
-            open_btn.setFixedSize(28, 28)
-            open_btn.setStyleSheet(
-                f"QPushButton {{ background: {SURFACE2}; border: 1px solid {BORDER};"
-                f"border-radius: 4px; font-size: 13px; }}"
-                f"QPushButton:hover {{ border-color: {ACCENT}; }}"
-            )
-            fp = entry.get("file_path")
-            if fp and os.path.exists(fp):
-                open_btn.setToolTip("Open in Explorer")
-                open_btn.clicked.connect(lambda _, p=fp: self._open_file(p))
-            else:
-                open_btn.setEnabled(False)
-                open_btn.setToolTip("File no longer available")
-
-            row.addLayout(info, 1)
-            row.addWidget(open_btn)
-
-            wrap = QWidget()
-            wrap.setStyleSheet("background: transparent;")
-            wrap.setLayout(row)
-            self._history_list_layout.addWidget(wrap)
-
-    def _open_file(self, path: str):
-        if sys.platform == "win32":
-            subprocess.Popen(f'explorer /select,"{path}"')
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path)])
-
-    def _clear_history(self):
-        self.history = []
-        self._save_history()
-        self._rebuild_history_ui()
-        self.history_card.setVisible(False)
+    def _open_history_dialog(self):
+        dlg = HistoryDialog(self.history, self)
+        dlg.history_cleared.connect(self._save_history)
+        dlg.setWindowFlag(Qt.WindowType.Window, True)
+        dlg.show()
 
     # ── Template ───────────────────────────────────────────────────────────────
 
@@ -1511,7 +1572,6 @@ class MainWindow(QMainWindow):
 
     def _show_token_picker(self):
         dlg = TokenPickerDialog(self)
-        # Position below the button
         btn_pos = self.tokens_btn.mapToGlobal(self.tokens_btn.rect().bottomLeft())
         dlg.move(btn_pos)
         dlg.resize(340, 220)
@@ -1528,7 +1588,6 @@ class MainWindow(QMainWindow):
 
     def _on_format_changed(self, _):
         self.fmt = self.format_combo.currentData()
-        # Disable bitrate for lossless
         lossless = self.fmt in ("flac", "wav")
         self.quality_combo.setEnabled(not lossless)
         self._save_settings()

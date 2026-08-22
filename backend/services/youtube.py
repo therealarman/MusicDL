@@ -1,10 +1,16 @@
+import logging
+import os
 import re
+import shutil
+import sys
 import asyncio
 import threading
 from typing import List, Optional, Callable, Tuple
 from pathlib import Path
 
 from ..models.schemas import TrackInfo, SourceType
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_yt_title(title: str, uploader: str = "") -> Tuple[str, str]:
@@ -18,7 +24,6 @@ def _parse_yt_title(title: str, uploader: str = "") -> Tuple[str, str]:
         if m:
             return m.group(1).strip(), m.group(2).strip()
 
-    # "Title by Artist" pattern
     by_match = re.match(r'^(.+?)\s+by\s+(.+)$', title.strip(), re.IGNORECASE)
     if by_match:
         return by_match.group(2).strip(), by_match.group(1).strip()
@@ -49,15 +54,76 @@ def _check_cookie_error(exc: Exception) -> None:
         ) from exc
 
 
+def _browser_profile_exists(browser: str) -> bool:
+    """Return False when the browser's profile directory is not found."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        local = os.environ.get("LOCALAPPDATA", "")
+        paths: dict = {
+            "firefox": os.path.join(appdata, "Mozilla", "Firefox", "Profiles"),
+            "chrome": os.path.join(local, "Google", "Chrome", "User Data"),
+            "chromium": os.path.join(local, "Chromium", "User Data"),
+            "brave": os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"),
+            "edge": os.path.join(local, "Microsoft", "Edge", "User Data"),
+            "opera": os.path.join(appdata, "Opera Software", "Opera Stable"),
+            "vivaldi": os.path.join(local, "Vivaldi", "User Data"),
+        }
+    elif sys.platform == "darwin":
+        paths = {
+            "firefox": os.path.join(home, "Library", "Application Support", "Firefox", "Profiles"),
+            "chrome": os.path.join(home, "Library", "Application Support", "Google", "Chrome"),
+            "safari": os.path.join(home, "Library", "Cookies"),
+        }
+    else:
+        paths = {
+            "firefox": os.path.join(home, ".mozilla", "firefox"),
+            "chrome": os.path.join(home, ".config", "google-chrome"),
+        }
+    profile_dir = paths.get(browser.lower())
+    if profile_dir is None:
+        return True  # Unknown browser — assume present
+    return os.path.isdir(profile_dir)
+
+
+def preflight_check(browser: str = "") -> None:
+    """Log warnings (no crash) when node or browser cookies may be unavailable."""
+    if shutil.which("node") is None:
+        logger.warning(
+            "Node.js not found on PATH — js_runtimes PO-token bypass will be skipped. "
+            "Install Node.js from https://nodejs.org/ and restart to enable full age-gate bypass."
+        )
+    if browser:
+        if not _browser_profile_exists(browser):
+            logger.warning(
+                "Browser '%s' profile directory not found — cookie access may fail. "
+                "Make sure %s is installed and you have logged into Google.",
+                browser, browser.title(),
+            )
+        locked = {"chrome", "chromium", "brave", "edge", "opera", "vivaldi"}
+        if browser.lower() in locked:
+            logger.info(
+                "Browser '%s' selected for cookies — ensure ALL windows are fully "
+                "closed before downloading (cookie DB is locked while browser is running).",
+                browser,
+            )
+
+
 class YouTubeService:
 
     def _cookies_opt(self, browser: str = "") -> dict:
         if browser:
-            return {"cookiesfrombrowser": (browser.lower(),)}
+            # 4-tuple required by yt-dlp >= 2023.11 for cookiesfrombrowser
+            return {"cookiesfrombrowser": (browser.lower(), None, None, None)}
         return {}
 
     def _quiet_opts(self, browser: str = "") -> dict:
-        return {"quiet": True, "no_warnings": True, **self._cookies_opt(browser)}
+        return {
+            "quiet": True,
+            "no_warnings": True,
+            "js_runtimes": {"node": {}},
+            **self._cookies_opt(browser),
+        }
 
     def get_video_info(self, url: str) -> TrackInfo:
         import yt_dlp
@@ -147,8 +213,13 @@ class YouTubeService:
         normalize: bool = False,
         on_progress: Optional[Callable[[float, str], None]] = None,
         cookies_browser: str = "",
+        cookie_file: str = "",
     ) -> str:
-        """Download and convert audio. Returns actual output file path."""
+        """Download and convert audio. Returns actual output file path.
+
+        Prefer cookie_file (pre-extracted per-batch) over cookies_browser to avoid
+        concurrent reads from the browser cookie DB.
+        """
         import yt_dlp
 
         dl_state = {"pct": 0.0, "status": "downloading"}
@@ -173,8 +244,18 @@ class YouTubeService:
         if normalize:
             postprocessors.append({"key": "FFmpegNormalize"})
 
-        ydl_opts = {
-            **self._quiet_opts(cookies_browser),
+        # Cookie settings: prefer pre-extracted batch file; fall back to live browser
+        cookies_opts: dict = {}
+        if cookie_file:
+            cookies_opts["cookiefile"] = cookie_file
+        elif cookies_browser:
+            cookies_opts["cookiesfrombrowser"] = (cookies_browser.lower(), None, None, None)
+
+        ydl_opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "js_runtimes": {"node": {}},
+            **cookies_opts,
             "format": "bestaudio/best",
             "outtmpl": output_template,
             "postprocessors": postprocessors,
@@ -209,14 +290,12 @@ class YouTubeService:
             _check_cookie_error(error_box[0])
             raise error_box[0]
 
-        # Resolve actual output path (yt-dlp replaces %(ext)s)
         ext = fmt if fmt != "best" else "mp3"
         actual = output_template.replace("%(ext)s", ext)
         p = Path(actual)
         if p.exists():
             return str(p)
 
-        # Fallback: scan parent directory
         parent = p.parent
         stem = p.stem
         for f in parent.iterdir():

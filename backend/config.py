@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     DOWNLOAD_DIR: str = "./downloads"
     TEMP_DIR: str = "./temp"
     MAX_CONCURRENT_DOWNLOADS: int = 3
+    DOWNLOAD_CONCURRENCY: int = 4
     FILE_CLEANUP_INTERVAL_MINUTES: int = 60
     MAX_PLAYLIST_SIZE: int = 500
 

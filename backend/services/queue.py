@@ -6,11 +6,16 @@ Progress is broadcast via per-job asyncio queues (for SSE streaming)
 and also stored in a replay list (for clients that connect late).
 """
 import asyncio
+import logging
+import os
+import shutil
+import stat
+import tempfile
 import threading
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -24,7 +29,21 @@ from ..models.schemas import (
 )
 from .filename import apply_template
 from .metadata import embed_metadata, _to_jpeg
-from .youtube import youtube_service
+from .youtube import youtube_service, preflight_check
+
+logger = logging.getLogger(__name__)
+
+# Transient HTTP errors worth retrying (403, throttle, rate-limit)
+_TRANSIENT_MARKERS = ("403", "throttled", "rate limit", "too many requests", "429", "connection reset")
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _TRANSIENT_MARKERS)
+
+
+def _is_age_restricted(exc: Exception) -> bool:
+    return "sign in to confirm your age" in str(exc).lower()
 
 
 # ── Job state ─────────────────────────────────────────────────────────────────
@@ -47,7 +66,6 @@ class DownloadJob:
         self.event_queue: asyncio.Queue = asyncio.Queue()
         self.cancel_event: asyncio.Event = asyncio.Event()
 
-        # Final file paths
         self.file_paths: Dict[str, str] = {}  # track_id -> absolute path
         self.zip_path: Optional[str] = None
 
@@ -105,6 +123,51 @@ async def _track_update(
     await _emit(job, "track_update", payload)
 
 
+# ── Batch cookie extraction ────────────────────────────────────────────────────
+
+async def _extract_batch_cookies(browser: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract browser cookies to a private temp directory once per batch.
+
+    Returns (cookie_file_path, tmp_dir) so the caller can delete the directory
+    when the batch finishes.  Both values are None when no browser is selected
+    or extraction fails.
+
+    The cookie file is written to an isolated tempdir (not the user's save-to
+    folder) and gets mode 0o600 so only the current user can read it.
+    """
+    if not browser:
+        return None, None
+    loop = asyncio.get_event_loop()
+
+    def _do() -> Tuple[Optional[str], Optional[str]]:
+        import yt_dlp
+        tmpdir = tempfile.mkdtemp(prefix="musicdl_cookies_")
+        cookie_file = os.path.join(tmpdir, "cookies.txt")
+        try:
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "no_warnings": True,
+                "cookiesfrombrowser": (browser.lower(), None, None, None),
+                "cookiefile": cookie_file,
+            }):
+                pass  # cookie extraction happens on context init
+            if os.path.exists(cookie_file):
+                try:
+                    os.chmod(cookie_file, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+                except OSError:
+                    pass  # best-effort on Windows
+                return cookie_file, tmpdir
+            logger.warning("Cookie extraction produced no file for browser '%s'", browser)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None, None
+        except Exception as exc:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            logger.warning("Could not extract browser cookies for batch: %s", exc)
+            return None, None
+
+    return await loop.run_in_executor(None, _do)
+
+
 # ── Main runner ────────────────────────────────────────────────────────────────
 
 async def run_download_job(job_id: str) -> None:
@@ -126,41 +189,61 @@ async def run_download_job(job_id: str) -> None:
         job_temp = Path(settings.TEMP_DIR) / job_id
     job_temp.mkdir(parents=True, exist_ok=True)
 
-    semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_DOWNLOADS)
+    # Log warnings for missing node / browser profile before any track starts
+    preflight_check(job.settings.cookies_browser)
+
+    # Extract cookies once for the whole batch into a private temp dir.
+    # We delete the temp dir in the finally block regardless of success/failure.
+    cookie_file, cookie_tmpdir = await _extract_batch_cookies(job.settings.cookies_browser)
+
+    concurrency = settings.DOWNLOAD_CONCURRENCY
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def process(track: TrackInfo) -> None:
         if job.cancel_event.is_set():
             await _track_update(job, track.id, "cancelled", 0)
             return
         async with semaphore:
-            await _download_track(job, track, job_temp)
+            await _download_track(job, track, job_temp, cookie_file)
 
-    await asyncio.gather(*[process(t) for t in job.tracks], return_exceptions=True)
+    try:
+        # Use as_completed so per-item completions surface immediately
+        tasks = [asyncio.create_task(process(t)) for t in job.tracks]
+        for fut in asyncio.as_completed(tasks):
+            try:
+                await fut
+            except Exception:
+                pass  # Already handled (and logged) inside _download_track
 
-    if job.cancel_event.is_set():
-        job.status = JobStatus.CANCELLED
-        await _emit(job, "job_update", {"status": "cancelled"})
-    else:
-        if job.file_paths:
-            await _create_zip(job, job_temp)
-        job.status = JobStatus.DONE
-        await _emit(job, "job_update", {
-            "status": "done",
-            "completed_tracks": job.completed,
-            "failed_tracks": job.failed,
-            "zip_ready": job.zip_path is not None,
-        })
+        if job.cancel_event.is_set():
+            job.status = JobStatus.CANCELLED
+            await _emit(job, "job_update", {"status": "cancelled"})
+        else:
+            if job.file_paths:
+                await _create_zip(job, job_temp)
+            job.status = JobStatus.DONE
+            await _emit(job, "job_update", {
+                "status": "done",
+                "completed_tracks": job.completed,
+                "failed_tracks": job.failed,
+                "zip_ready": job.zip_path is not None,
+            })
+    finally:
+        # Always remove the private cookie temp dir
+        if cookie_tmpdir:
+            shutil.rmtree(cookie_tmpdir, ignore_errors=True)
 
     await _emit(job, "done", {})
 
 
 # ── Per-track downloader ───────────────────────────────────────────────────────
 
-def _is_age_restricted(exc: Exception) -> bool:
-    return "sign in to confirm your age" in str(exc).lower()
-
-
-async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) -> None:
+async def _download_track(
+    job: DownloadJob,
+    track: TrackInfo,
+    job_temp: Path,
+    cookie_file: Optional[str] = None,
+) -> None:
     track_id = track.id
     fmt = job.settings.format.value
     quality = job.settings.quality.value
@@ -188,7 +271,7 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
         filename = apply_template(job.settings.filename_template, track)
         out_template = str(job_temp / f"{filename}.%(ext)s")
 
-        # 3. Download (with live progress polling, retrying on age restriction)
+        # 3. Download with live progress polling, fallback URLs, and transient-error retry
         dl_state = {"pct": 0.0, "stage": "downloading"}
 
         def on_progress(pct: float, stage: str) -> None:
@@ -220,21 +303,35 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
 
             progress_done = asyncio.Event()
             poll_task = asyncio.create_task(poll_progress(progress_done))
-
             try:
-                file_path = await youtube_service.download_audio(
-                    url=attempt_url,
-                    output_template=out_template,
-                    fmt=fmt,
-                    quality=quality,
-                    normalize=job.settings.normalize_audio,
-                    on_progress=on_progress,
-                    cookies_browser=job.settings.cookies_browser,
-                )
-                break  # success — stop trying
+                # Inner retry loop for transient 403 / throttle errors (up to 2 retries)
+                for transient_try in range(3):
+                    try:
+                        file_path = await youtube_service.download_audio(
+                            url=attempt_url,
+                            output_template=out_template,
+                            fmt=fmt,
+                            quality=quality,
+                            normalize=job.settings.normalize_audio,
+                            on_progress=on_progress,
+                            cookies_browser="" if cookie_file else job.settings.cookies_browser,
+                            cookie_file=cookie_file or "",
+                        )
+                        break  # success
+                    except Exception as exc:
+                        if transient_try < 2 and _is_transient(exc):
+                            wait = 5 * (2 ** transient_try)  # 5s, 10s
+                            logger.warning(
+                                "Transient error on '%s' (try %d/3), retrying in %ds: %s",
+                                track.title, transient_try + 1, wait, exc,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        raise
+                break  # URL attempt succeeded
             except Exception as exc:
                 if i < len(urls_to_try) - 1 and _is_age_restricted(exc) and not job.settings.cookies_browser:
-                    continue
+                    continue  # try next candidate URL
                 raise
             finally:
                 progress_done.set()
@@ -260,7 +357,6 @@ async def _download_track(job: DownloadJob, track: TrackInfo, job_temp: Path) ->
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, embed_metadata, file_path, track, album_art_data)
 
-        # Optionally save cover art as a separate JPEG alongside the audio file
         if job.settings.download_thumbnail and album_art_data:
             try:
                 thumb_data = await loop.run_in_executor(None, _to_jpeg, album_art_data)
